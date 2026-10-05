@@ -1,0 +1,115 @@
+# Reference GitHub Actions workflow for slopscan.
+# Copy to your repo at .github/workflows/slopscan.yml.
+#
+# Runs on every PR; comments the diff vs base branch.
+
+name: slopscan
+
+on:
+  pull_request:
+    branches: [main, master, dev]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Install slopscan
+        run: |
+          git clone --depth 1 https://github.com/Hugo0/slopscan.git /tmp/slopscan
+          cd /tmp/slopscan && pnpm install --silent
+
+      - name: Run analysis (head)
+        run: |
+          node /tmp/slopscan/bin/analyze.mjs \
+            --root . \
+            --include src \
+            --analyzers complexity,structural-dup,dead-code,import-graph,churn \
+            --out-dir analysis-head
+
+      - name: Checkout base ref
+        run: |
+          git fetch origin ${{ github.base_ref }}:base-ref
+          git worktree add ../base-tree base-ref
+
+      - name: Run analysis (base)
+        run: |
+          node /tmp/slopscan/bin/analyze.mjs \
+            --root ../base-tree \
+            --include src \
+            --analyzers complexity,structural-dup,dead-code,import-graph,churn \
+            --out-dir analysis-base
+
+      - name: Diff
+        run: |
+          node /tmp/slopscan/bin/diff.mjs \
+            --base analysis-base \
+            --head analysis-head \
+            --out diff.md \
+            --out-json diff.json
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: slopscan
+          path: |
+            analysis-head/
+            diff.md
+            diff.json
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('diff.md', 'utf-8');
+            const { data: comments } = await github.rest.issues.listComments({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const tag = '<!-- slopscan -->';
+            const existing = comments.find(c => c.body && c.body.includes(tag));
+            const final = tag + '\n' + body;
+            if (existing) {
+              await github.rest.issues.updateComment({
+                comment_id: existing.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: final,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: final,
+              });
+            }
+
+      - name: Fail if regression
+        run: |
+          NET=$(jq '.counts.net' diff.json)
+          if [ "$NET" -gt 50 ]; then
+            echo "slopscan: +$NET new findings (threshold: 50)"
+            exit 1
+          fi
